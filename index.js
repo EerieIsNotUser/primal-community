@@ -43,6 +43,16 @@ const OWNER_USER_ID = process.env.OWNER_USER_ID || '1289766186170581120';
 const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
 const COMMIT_THUMBNAIL_URL = process.env.COMMIT_THUMBNAIL_URL || null; // optional
 
+// Maps GitHub login -> how it should display in push notification embeds.
+// Anyone not listed here just shows their literal GitHub username.
+const GITHUB_DISPLAY_NAMES = {
+  EerieIsNotUser: 'EerieIsUser',
+};
+
+function resolveDisplayName(githubLogin) {
+  return GITHUB_DISPLAY_NAMES[githubLogin] || githubLogin;
+}
+
 // ─── Supabase ────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
@@ -368,17 +378,18 @@ webhookApp.post('/github-webhook', async (req, res) => {
   }
 
   const branch = (payload.ref || '').replace('refs/heads/', '') || 'unknown';
+  const displayName = resolveDisplayName(payload.sender.login);
 
   for (const commit of payload.commits) {
     const embed = new EmbedBuilder()
       .setColor(0x5865F2)
-      .setAuthor({ name: `${payload.sender.login} pushed an update`, iconURL: payload.sender.avatar_url })
+      .setAuthor({ name: `${displayName} pushed an update`, iconURL: payload.sender.avatar_url })
       .setDescription(commit.message)
       .addFields(
         { name: 'Branch', value: branch, inline: true },
         { name: 'Repository', value: payload.repository.name, inline: true },
       )
-      .setFooter({ text: `Discord: @${payload.sender.login}` })
+      .setFooter({ text: `Discord: @${displayName}` })
       .setTimestamp(new Date(commit.timestamp));
 
     if (COMMIT_THUMBNAIL_URL) embed.setThumbnail(COMMIT_THUMBNAIL_URL);
