@@ -1,6 +1,8 @@
 require('dotenv').config();
 const { Client, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const { createClient } = require('@supabase/supabase-js');
+const express = require('express');
+const crypto = require('crypto');
 
 // ─── Config ──────────────────────────────────────────────────────────────────
 // MAIN_GUILD_ID = the main Primal Pursuit Discord server. This is the ONLY
@@ -34,6 +36,12 @@ const DEV_LOG_CHANNEL_ID = process.env.DEV_LOG_CHANNEL_ID || '151816281838020205
 // handler itself, not just via Discord's default_member_permissions (which
 // a server owner could otherwise reconfigure away).
 const OWNER_USER_ID = process.env.OWNER_USER_ID || '1289766186170581120';
+
+// GitHub push notifications — custom embed sent via this bot's own identity,
+// not Discord's generic native GitHub webhook parsing. Secret is required;
+// requests without a valid signature are rejected outright.
+const GITHUB_WEBHOOK_SECRET = process.env.GITHUB_WEBHOOK_SECRET;
+const COMMIT_THUMBNAIL_URL = process.env.COMMIT_THUMBNAIL_URL || null; // optional
 
 // ─── Supabase ────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
@@ -317,6 +325,72 @@ client.on('interactionCreate', async (interaction) => {
   console.log(`[bansync] /killprimal invoked by ${interaction.user.username} (${interaction.user.id}). Shutting down.`);
 
   setTimeout(() => process.exit(0), 1000); // give Discord a moment to deliver the reply first
+});
+
+// ─── GitHub webhook receiver ────────────────────────────────────────────────
+// Runs its own tiny HTTP server alongside the Discord client. GitHub posts
+// push events here directly (not through Discord's native webhook parsing),
+// so the resulting message comes from this bot's own identity in the same
+// style PrimalBot already uses.
+function verifyGithubSignature(rawBody, signatureHeader) {
+  if (!GITHUB_WEBHOOK_SECRET || !signatureHeader || !rawBody) return false;
+  const digest = `sha256=${crypto.createHmac('sha256', GITHUB_WEBHOOK_SECRET).update(rawBody).digest('hex')}`;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signatureHeader));
+  } catch {
+    return false; // mismatched length etc. — definitely not a match
+  }
+}
+
+const webhookApp = express();
+webhookApp.use(express.json({ verify: (req, res, buf) => { req.rawBody = buf; } }));
+
+webhookApp.get('/', (req, res) => res.status(200).send('primal-bansync is running'));
+
+webhookApp.post('/github-webhook', async (req, res) => {
+  if (!verifyGithubSignature(req.rawBody, req.headers['x-hub-signature-256'])) {
+    console.warn('[bansync] Rejected GitHub webhook delivery — invalid or missing signature.');
+    return res.status(401).send('Invalid signature');
+  }
+
+  const githubEvent = req.headers['x-github-event'];
+  if (githubEvent === 'ping') {
+    console.log('[bansync] GitHub webhook ping received — configured correctly.');
+    return res.status(200).send('pong');
+  }
+  if (githubEvent !== 'push') {
+    return res.status(200).send('Ignored — not a push event');
+  }
+
+  const payload = req.body;
+  if (!payload.commits || payload.commits.length === 0) {
+    return res.status(200).send('No commits to report');
+  }
+
+  const branch = (payload.ref || '').replace('refs/heads/', '') || 'unknown';
+
+  for (const commit of payload.commits) {
+    const embed = new EmbedBuilder()
+      .setColor(0x5865F2)
+      .setAuthor({ name: `${payload.sender.login} pushed an update`, iconURL: payload.sender.avatar_url })
+      .setDescription(commit.message)
+      .addFields(
+        { name: 'Branch', value: branch, inline: true },
+        { name: 'Repository', value: payload.repository.name, inline: true },
+      )
+      .setFooter({ text: `Discord: @${payload.sender.login}` })
+      .setTimestamp(new Date(commit.timestamp));
+
+    if (COMMIT_THUMBNAIL_URL) embed.setThumbnail(COMMIT_THUMBNAIL_URL);
+
+    await postDevLog(embed);
+  }
+
+  res.status(200).send('OK');
+});
+
+webhookApp.listen(process.env.PORT || 3000, () => {
+  console.log(`[bansync] GitHub webhook server listening on port ${process.env.PORT || 3000}.`);
 });
 
 // ─── Live events ─────────────────────────────────────────────────────────────
