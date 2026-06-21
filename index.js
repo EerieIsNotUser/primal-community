@@ -25,6 +25,11 @@ const EXTERNAL_GUILDS = {
 
 const SYNC_REASON = 'Action happened in Primal Pursuit server';
 
+// Combined dev channel — GitHub push notifications + live ban/unban events.
+// Backfill does NOT post here (would flood it on first deploy); only live
+// events do.
+const DEV_LOG_CHANNEL_ID = process.env.DEV_LOG_CHANNEL_ID || '1518162818380202054';
+
 // ─── Supabase ────────────────────────────────────────────────────────────────
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY);
 
@@ -88,24 +93,63 @@ async function postLog(guild, cfg, embed) {
   }
 }
 
+// Dev channel uses the global channel manager (not guild-scoped) since it
+// can live in any server the bot is a member of, independent of main/
+// Chickenblox/AnkyTrike.
+async function postDevLog(embed) {
+  try {
+    const channel = client.channels.cache.get(DEV_LOG_CHANNEL_ID)
+      || await client.channels.fetch(DEV_LOG_CHANNEL_ID).catch(() => null);
+    if (channel?.isTextBased()) {
+      await channel.send({ embeds: [embed] });
+    } else {
+      console.warn(`[bansync] Dev log channel ${DEV_LOG_CHANNEL_ID} not found or not text-based.`);
+    }
+  } catch (err) {
+    console.error('[bansync] Failed to post dev log:', err.message);
+  }
+}
+
+const STATUS_LABELS = {
+  banned: '✅ Banned',
+  unbanned: '✅ Unbanned',
+  already_banned: '⏭️ Already banned',
+  not_banned: '⏭️ Not banned there',
+  not_in_guild: '⚠️ Bot not in server',
+  error: '❌ Failed',
+};
+
+function buildDevLogEmbed(action, userId, username, results) {
+  const fieldValue = results
+    .map(r => `**${r.guildName}:** ${STATUS_LABELS[r.status] || r.status}${r.error ? ` — ${r.error}` : ''}`)
+    .join('\n') || 'No targets configured';
+
+  return new EmbedBuilder()
+    .setColor(action === 'ban' ? 0xE74C3C : 0x2ECC71)
+    .setTitle(action === 'ban' ? '🔨 Ban Event — Primal Pursuit Main' : '🔓 Unban Event — Primal Pursuit Main')
+    .setDescription(`**${username}** (\`${userId}\`)`)
+    .addFields({ name: 'Sync Results', value: fieldValue })
+    .setTimestamp();
+}
+
 // ─── Sync ────────────────────────────────────────────────────────────────────
 // Chickenblox and AnkyTrike are synced in parallel — fully independent of
 // each other, no reason to wait on one before starting the other.
 async function syncBan(userId, username, { isBackfill = false } = {}) {
   const source = isBackfill ? 'backfill' : 'live';
 
-  await Promise.all(Object.entries(EXTERNAL_GUILDS).map(async ([guildId, cfg]) => {
+  return Promise.all(Object.entries(EXTERNAL_GUILDS).map(async ([guildId, cfg]) => {
     try {
       const guild = await resolveGuild(guildId);
       if (!guild) {
         console.error(`[bansync] Bot is not in ${cfg.name} (${guildId}) — skipping.`);
-        return;
+        return { guildName: cfg.name, status: 'not_in_guild' };
       }
 
       const alreadyBanned = await isBanned(guild, userId);
       if (alreadyBanned) {
         console.log(`[bansync]${isBackfill ? ' [backfill]' : ''} ${username} (${userId}) already banned in ${cfg.name} — skipping.`);
-        return; // nothing happened — not logged
+        return { guildName: cfg.name, status: 'already_banned' };
       }
 
       await guild.bans.create(userId, { reason: SYNC_REASON });
@@ -128,6 +172,8 @@ async function syncBan(userId, username, { isBackfill = false } = {}) {
           .setTimestamp()
         ),
       ]);
+
+      return { guildName: cfg.name, status: 'banned' };
     } catch (err) {
       console.error(`[bansync] Failed to sync ban for ${userId} in ${cfg.name}:`, err.message);
       await logEvent({
@@ -135,23 +181,24 @@ async function syncBan(userId, username, { isBackfill = false } = {}) {
         targetGuildId: guildId, targetGuildName: cfg.name,
         success: false, errorMessage: err.message, source,
       });
+      return { guildName: cfg.name, status: 'error', error: err.message };
     }
   }));
 }
 
 async function syncUnban(userId, username) {
-  await Promise.all(Object.entries(EXTERNAL_GUILDS).map(async ([guildId, cfg]) => {
+  return Promise.all(Object.entries(EXTERNAL_GUILDS).map(async ([guildId, cfg]) => {
     try {
       const guild = await resolveGuild(guildId);
       if (!guild) {
         console.error(`[bansync] Bot is not in ${cfg.name} (${guildId}) — skipping.`);
-        return;
+        return { guildName: cfg.name, status: 'not_in_guild' };
       }
 
       const stillBanned = await isBanned(guild, userId);
       if (!stillBanned) {
         console.log(`[bansync] ${username} (${userId}) not banned in ${cfg.name} — skipping unban.`);
-        return;
+        return { guildName: cfg.name, status: 'not_banned' };
       }
 
       await guild.bans.remove(userId, SYNC_REASON);
@@ -171,6 +218,8 @@ async function syncUnban(userId, username) {
           .setTimestamp()
         ),
       ]);
+
+      return { guildName: cfg.name, status: 'unbanned' };
     } catch (err) {
       console.error(`[bansync] Failed to sync unban for ${userId} in ${cfg.name}:`, err.message);
       await logEvent({
@@ -178,6 +227,7 @@ async function syncUnban(userId, username) {
         targetGuildId: guildId, targetGuildName: cfg.name,
         success: false, errorMessage: err.message, source: 'live',
       });
+      return { guildName: cfg.name, status: 'error', error: err.message };
     }
   }));
 }
@@ -209,12 +259,14 @@ async function backfill() {
 // ─── Live events ─────────────────────────────────────────────────────────────
 client.on('guildBanAdd', async (ban) => {
   if (ban.guild.id !== MAIN_GUILD_ID) return; // ignore anything not from main
-  await syncBan(ban.user.id, ban.user.username);
+  const results = await syncBan(ban.user.id, ban.user.username);
+  await postDevLog(buildDevLogEmbed('ban', ban.user.id, ban.user.username, results));
 });
 
 client.on('guildBanRemove', async (ban) => {
   if (ban.guild.id !== MAIN_GUILD_ID) return; // ignore anything not from main
-  await syncUnban(ban.user.id, ban.user.username);
+  const results = await syncUnban(ban.user.id, ban.user.username);
+  await postDevLog(buildDevLogEmbed('unban', ban.user.id, ban.user.username, results));
 });
 
 client.once('ready', async () => {
