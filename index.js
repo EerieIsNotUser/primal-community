@@ -55,6 +55,17 @@ const client = new Client({
 });
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+// Cache-first guild/channel resolution — avoids a REST round-trip on every
+// single ban/unban event when the bot is already a member of the guild
+// (which it always is here, since it only ever sits in 3 fixed servers).
+async function resolveGuild(guildId) {
+  return client.guilds.cache.get(guildId) || await client.guilds.fetch(guildId).catch(() => null);
+}
+
+async function resolveChannel(guild, channelId) {
+  return guild.channels.cache.get(channelId) || await guild.channels.fetch(channelId).catch(() => null);
+}
+
 async function isBanned(guild, userId) {
   try {
     await guild.bans.fetch(userId);
@@ -64,12 +75,9 @@ async function isBanned(guild, userId) {
   }
 }
 
-async function postLog(guildId, embed) {
-  const cfg = EXTERNAL_GUILDS[guildId];
-  if (!cfg) return;
+async function postLog(guild, cfg, embed) {
   try {
-    const guild = await client.guilds.fetch(guildId);
-    const channel = await guild.channels.fetch(cfg.logChannelId).catch(() => null);
+    const channel = await resolveChannel(guild, cfg.logChannelId);
     if (channel?.isTextBased()) {
       await channel.send({ embeds: [embed] });
     } else {
@@ -80,39 +88,46 @@ async function postLog(guildId, embed) {
   }
 }
 
+// ─── Sync ────────────────────────────────────────────────────────────────────
+// Chickenblox and AnkyTrike are synced in parallel — fully independent of
+// each other, no reason to wait on one before starting the other.
 async function syncBan(userId, username, { isBackfill = false } = {}) {
   const source = isBackfill ? 'backfill' : 'live';
 
-  for (const guildId of Object.keys(EXTERNAL_GUILDS)) {
-    const cfg = EXTERNAL_GUILDS[guildId];
+  await Promise.all(Object.entries(EXTERNAL_GUILDS).map(async ([guildId, cfg]) => {
     try {
-      const guild = await client.guilds.fetch(guildId);
-      const alreadyBanned = await isBanned(guild, userId);
+      const guild = await resolveGuild(guildId);
+      if (!guild) {
+        console.error(`[bansync] Bot is not in ${cfg.name} (${guildId}) — skipping.`);
+        return;
+      }
 
+      const alreadyBanned = await isBanned(guild, userId);
       if (alreadyBanned) {
         console.log(`[bansync]${isBackfill ? ' [backfill]' : ''} ${username} (${userId}) already banned in ${cfg.name} — skipping.`);
-        continue; // nothing happened — not logged
+        return; // nothing happened — not logged
       }
 
       await guild.bans.create(userId, { reason: SYNC_REASON });
       console.log(`[bansync]${isBackfill ? ' [backfill]' : ''} Banned ${username} (${userId}) in ${cfg.name}.`);
 
-      await logEvent({
-        userId, username, action: 'ban',
-        targetGuildId: guildId, targetGuildName: cfg.name,
-        success: true, source,
-      });
-
-      await postLog(guildId, new EmbedBuilder()
-        .setColor(0xE74C3C)
-        .setTitle('🔨 Cross-Server Ban Sync')
-        .setDescription(
-          `**${username}** (\`${userId}\`) was banned in the Primal Pursuit main server and has been automatically banned from this server.` +
-          (isBackfill ? '\n*(applied via startup backfill)*' : '')
-        )
-        .addFields({ name: 'Reason', value: SYNC_REASON })
-        .setTimestamp()
-      );
+      await Promise.all([
+        logEvent({
+          userId, username, action: 'ban',
+          targetGuildId: guildId, targetGuildName: cfg.name,
+          success: true, source,
+        }),
+        postLog(guild, cfg, new EmbedBuilder()
+          .setColor(0xE74C3C)
+          .setTitle('🔨 Cross-Server Ban Sync')
+          .setDescription(
+            `**${username}** (\`${userId}\`) was banned in the Primal Pursuit main server and has been automatically banned from this server.` +
+            (isBackfill ? '\n*(applied via startup backfill)*' : '')
+          )
+          .addFields({ name: 'Reason', value: SYNC_REASON })
+          .setTimestamp()
+        ),
+      ]);
     } catch (err) {
       console.error(`[bansync] Failed to sync ban for ${userId} in ${cfg.name}:`, err.message);
       await logEvent({
@@ -121,37 +136,41 @@ async function syncBan(userId, username, { isBackfill = false } = {}) {
         success: false, errorMessage: err.message, source,
       });
     }
-  }
+  }));
 }
 
 async function syncUnban(userId, username) {
-  for (const guildId of Object.keys(EXTERNAL_GUILDS)) {
-    const cfg = EXTERNAL_GUILDS[guildId];
+  await Promise.all(Object.entries(EXTERNAL_GUILDS).map(async ([guildId, cfg]) => {
     try {
-      const guild = await client.guilds.fetch(guildId);
-      const stillBanned = await isBanned(guild, userId);
+      const guild = await resolveGuild(guildId);
+      if (!guild) {
+        console.error(`[bansync] Bot is not in ${cfg.name} (${guildId}) — skipping.`);
+        return;
+      }
 
+      const stillBanned = await isBanned(guild, userId);
       if (!stillBanned) {
         console.log(`[bansync] ${username} (${userId}) not banned in ${cfg.name} — skipping unban.`);
-        continue;
+        return;
       }
 
       await guild.bans.remove(userId, SYNC_REASON);
       console.log(`[bansync] Unbanned ${username} (${userId}) in ${cfg.name}.`);
 
-      await logEvent({
-        userId, username, action: 'unban',
-        targetGuildId: guildId, targetGuildName: cfg.name,
-        success: true, source: 'live',
-      });
-
-      await postLog(guildId, new EmbedBuilder()
-        .setColor(0x2ECC71)
-        .setTitle('🔓 Cross-Server Unban Sync')
-        .setDescription(`**${username}** (\`${userId}\`) was unbanned in the Primal Pursuit main server and has been automatically unbanned from this server.`)
-        .addFields({ name: 'Reason', value: SYNC_REASON })
-        .setTimestamp()
-      );
+      await Promise.all([
+        logEvent({
+          userId, username, action: 'unban',
+          targetGuildId: guildId, targetGuildName: cfg.name,
+          success: true, source: 'live',
+        }),
+        postLog(guild, cfg, new EmbedBuilder()
+          .setColor(0x2ECC71)
+          .setTitle('🔓 Cross-Server Unban Sync')
+          .setDescription(`**${username}** (\`${userId}\`) was unbanned in the Primal Pursuit main server and has been automatically unbanned from this server.`)
+          .addFields({ name: 'Reason', value: SYNC_REASON })
+          .setTimestamp()
+        ),
+      ]);
     } catch (err) {
       console.error(`[bansync] Failed to sync unban for ${userId} in ${cfg.name}:`, err.message);
       await logEvent({
@@ -160,7 +179,7 @@ async function syncUnban(userId, username) {
         success: false, errorMessage: err.message, source: 'live',
       });
     }
-  }
+  }));
 }
 
 // ─── Startup backfill ────────────────────────────────────────────────────────
@@ -170,7 +189,11 @@ async function syncUnban(userId, username) {
 async function backfill() {
   console.log('[bansync] Running startup backfill...');
   try {
-    const mainGuild = await client.guilds.fetch(MAIN_GUILD_ID);
+    const mainGuild = await resolveGuild(MAIN_GUILD_ID);
+    if (!mainGuild) {
+      console.error('[bansync] Bot is not in the main guild — cannot backfill.');
+      return;
+    }
     const mainBans = await mainGuild.bans.fetch();
     console.log(`[bansync] Main server has ${mainBans.size} ban(s) on record.`);
 
